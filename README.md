@@ -200,7 +200,7 @@ Built as a demonstration of:
 
 ## 📞 Contact
 
-**LinkedIn:** [\[Profile\] ](https://www.linkedin.com/in/binepalsingh/)
+**LinkedIn:** [linked.com/in/binepalsingh](https://www.linkedin.com/in/binepalsingh/)
 **Email:** binepalsingh@hotmail.com
 
 ## 📜 License

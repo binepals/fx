@@ -198,7 +198,7 @@ def get_available_currencies():
         return []
 
 def get_available_months():
-    """Get list of available months with data"""
+    """Get list of available months with data, defaulting to latest complete month"""
     try:
         conn = sqlite3.connect('fx_rates.db')
         query = """
@@ -210,14 +210,40 @@ def get_available_months():
         conn.close()
         
         months = []
+        today = date.today()
+        
         for _, row in df.iterrows():
             year = int(row['year'])
             month = int(row['month'])
-            months.append((year, month, f"{calendar.month_name[month]} {year}"))
+            
+            # Check if this is a complete month (last day has passed)
+            last_day_of_month = date(year, month, calendar.monthrange(year, month)[1])
+            is_complete = last_day_of_month < today
+            
+            month_name = calendar.month_name[month]
+            if is_complete:
+                display_name = f"{month_name} {year}"
+            else:
+                display_name = f"{month_name} {year} (In Progress)"
+            
+            months.append((year, month, display_name, is_complete))
         
         return months
     except:
         return []
+
+def is_month_complete(year, month):
+    """Check if a month is complete (all working days have passed)"""
+    today = date.today()
+    last_day_of_month = date(year, month, calendar.monthrange(year, month)[1])
+    return last_day_of_month < today
+
+def get_next_working_day(target_date):
+    """Get the next working day after the given date"""
+    next_day = target_date + timedelta(days=1)
+    while next_day.weekday() >= 5:  # Skip weekends
+        next_day += timedelta(days=1)
+    return next_day
 
 # =============================================================================
 # STREAMLIT DASHBOARD
@@ -231,7 +257,7 @@ def main():
     
     # Check if database exists
     if not os.path.exists('fx_rates.db'):
-        st.error("❌ Database not found! Please run the data collection script first.")
+        st.error("❌ Database not found! Please run the ECB data collection script first.")
         st.stop()
     
     # Sidebar - Configuration
@@ -242,52 +268,67 @@ def main():
     available_months = get_available_months()
     
     if not available_currencies:
-        st.error("❌ No exchange rate data found! Please run the data collection script first.")
+        st.error("❌ No exchange rate data found! Please run the ECB data collection script first.")
         st.stop()
     
-    # Currency Selection
+    # Currency Selection - Updated for Application Currencies
     st.sidebar.subheader("💱 Currency Selection")
     
-    # Preset currency groups
-    major_currencies = ['USD', 'EUR', 'JPY', 'CAD', 'AUD', 'CHF', 'CNY']
-    available_major = [curr for curr in major_currencies if curr in available_currencies]
+    # Application currency groups (common business currencies)
+    application_currencies = ['USD', 'EUR', 'JPY', 'CAD', 'AUD', 'CHF', 'CNY']
+    available_application = [curr for curr in application_currencies if curr in available_currencies]
     
     currency_mode = st.sidebar.radio(
         "Select currencies:",
-        ["Major Currencies", "Custom Selection", "All Available"]
+        ["Application Currencies", "Custom Selection", "All Available"]
     )
     
-    if currency_mode == "Major Currencies":
+    if currency_mode == "Application Currencies":
         selected_currencies = st.sidebar.multiselect(
-            "Major currencies:",
-            available_major,
-            default=available_major[:5] if len(available_major) >= 5 else available_major
+            "Application currencies:",
+            available_application,
+            default=available_application[:5] if len(available_application) >= 5 else available_application,
+            help="Standard currencies used in your organisation's foreign exchange transactions"
         )
     elif currency_mode == "Custom Selection":
         selected_currencies = st.sidebar.multiselect(
             "Choose currencies:",
             available_currencies,
-            default=available_major[:3] if available_major else available_currencies[:3]
+            default=available_application[:3] if available_application else available_currencies[:3]
         )
     else:
         selected_currencies = available_currencies
         st.sidebar.info(f"All {len(available_currencies)} available currencies selected")
     
-    # Time Period Selection
+    # Time Period Selection - Updated for latest complete month default
     st.sidebar.subheader("📅 Time Period")
     
     if available_months:
-        month_options = {f"{month_name}": (year, month) for year, month, month_name in available_months}
+        # Find the latest complete month as default
+        complete_months = [(year, month, display_name) for year, month, display_name, is_complete in available_months if is_complete]
+        
+        if complete_months:
+            month_options = {display_name: (year, month) for year, month, display_name in complete_months}
+            default_selection = list(month_options.keys())[0]  # Latest complete month
+        else:
+            # If no complete months, show all with indicators
+            month_options = {display_name: (year, month) for year, month, display_name, _ in available_months}
+            default_selection = list(month_options.keys())[0]
         
         selected_month_name = st.sidebar.selectbox(
             "Select month:",
-            list(month_options.keys())
+            list(month_options.keys()),
+            index=0,  # Default to first (latest) month
+            help="Rates for current month available from 1st working day of following month"
         )
         
         selected_year, selected_month = month_options[selected_month_name]
     else:
         st.error("❌ No data available for any months")
         st.stop()
+    
+    # Check if selected month is complete
+    month_is_complete = is_month_complete(selected_year, selected_month)
     
     # Main Dashboard
     if selected_currencies:
@@ -302,6 +343,12 @@ def main():
             working_days = len(get_working_days_in_month(selected_year, selected_month))
             st.metric("📊 Working Days", working_days)
         
+        # Month status indicator
+        if not month_is_complete:
+            last_day = date(selected_year, selected_month, calendar.monthrange(selected_year, selected_month)[1])
+            next_working_day = get_next_working_day(last_day)
+            st.info(f"ℹ️ **Month in Progress:** Average and Closing rates for {calendar.month_name[selected_month]} {selected_year} will be available from {next_working_day.strftime('%d %B %Y')} (first working day of following month)")
+        
         st.divider()
         
         # Get data
@@ -309,8 +356,8 @@ def main():
         
         if len(summary_data) > 0:
             
-            # Tab layout
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Rate Summary", "📈 Visualizations", "📁 Export Data", "📋 Raw Data"])
+            # Tab layout - Updated spelling
+            tab1, tab2, tab3, tab4 = st.tabs(["📊 Rate Summary", "📈 Visualisations", "📁 Export Data", "📋 Raw Data"])
             
             with tab1:
                 st.subheader("💱 Exchange Rate Summary")
@@ -359,7 +406,7 @@ def main():
                 )
             
             with tab2:
-                st.subheader("📈 Exchange Rate Visualizations")
+                st.subheader("📈 Exchange Rate Visualisations")
                 
                 # Chart 1: Average vs Closing Rates
                 fig1 = go.Figure()
@@ -490,15 +537,18 @@ def main():
                     st.warning("No raw data available for selected period")
         
         else:
-            st.warning(f"❌ No data available for {calendar.month_name[selected_month]} {selected_year}")
-            st.info("💡 Make sure you have run the data collection script for this time period")
+            if not month_is_complete:
+                st.info(f"ℹ️ **Rates Not Yet Available:** Average and Closing rates for {calendar.month_name[selected_month]} {selected_year} will be calculated and available from the first working day of {calendar.month_name[selected_month + 1 if selected_month < 12 else 1]} {selected_year if selected_month < 12 else selected_year + 1}")
+            else:
+                st.warning(f"❌ No data available for {calendar.month_name[selected_month]} {selected_year}")
+                st.info("💡 Make sure you have run the ECB data collection script for this time period")
     
     else:
-        st.warning("⚠️ Please select at least one currency to analyze")
+        st.warning("⚠️ Please select at least one currency to analyse")
     
-    # Footer
+    # Footer - Updated citation
     st.divider()
-    st.markdown("*Exchange Rate Dashboard - Built with Python, Streamlit & European Central Bank Data*")
+    st.markdown("*Exchange Rate Dashboard - Built with Claude, Python, Streamlit & European Central Bank Data*")
 
 if __name__ == "__main__":
     main()
