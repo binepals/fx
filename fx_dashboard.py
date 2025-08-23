@@ -9,6 +9,7 @@ from datetime import datetime, date, timedelta
 import calendar
 import os
 from io import BytesIO
+import json
 
 # =============================================================================
 # PAGE CONFIGURATION
@@ -22,7 +23,147 @@ st.set_page_config(
 )
 
 # =============================================================================
-# BUSINESS LOGIC FUNCTIONS
+# DATABASE FUNCTIONS
+# =============================================================================
+
+def create_currency_config_table():
+    """Create table to store user's application currency configuration"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS application_currencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                currency_code TEXT UNIQUE NOT NULL,
+                currency_name TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT
+            )
+        ''')
+        
+        # Insert default application currencies if table is empty
+        cursor.execute("SELECT COUNT(*) FROM application_currencies")
+        if cursor.fetchone()[0] == 0:
+            default_currencies = [
+                ('USD', 'US Dollar'),
+                ('EUR', 'Euro'),
+                ('JPY', 'Japanese Yen'),
+                ('CAD', 'Canadian Dollar'),
+                ('AUD', 'Australian Dollar'),
+                ('CHF', 'Swiss Franc'),
+                ('CNY', 'Chinese Yuan')
+            ]
+            
+            cursor.executemany(
+                "INSERT INTO application_currencies (currency_code, currency_name) VALUES (?, ?)",
+                default_currencies
+            )
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        st.error(f"Error creating currency config table: {str(e)}")
+        return False
+
+def get_application_currencies():
+    """Get list of configured application currencies"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        query = """
+            SELECT currency_code, currency_name, is_active 
+            FROM application_currencies 
+            WHERE is_active = 1 
+            ORDER BY currency_code
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        return df['currency_code'].tolist()
+    except:
+        # Fallback to default if table doesn't exist
+        return ['USD', 'EUR', 'JPY', 'CAD', 'AUD', 'CHF', 'CNY']
+
+def get_all_available_currencies():
+    """Get all currencies available in exchange rate data"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        query = "SELECT DISTINCT target_currency FROM exchange_rates ORDER BY target_currency"
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df['target_currency'].tolist()
+    except:
+        return []
+
+def add_application_currency(currency_code, currency_name=None):
+    """Add a new currency to application currencies"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO application_currencies 
+            (currency_code, currency_name, is_active) 
+            VALUES (?, ?, 1)
+        ''', (currency_code, currency_name or currency_code))
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        st.error(f"Error adding currency: {str(e)}")
+        return False
+
+def remove_application_currency(currency_code):
+    """Remove a currency from application currencies (set inactive)"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "UPDATE application_currencies SET is_active = 0 WHERE currency_code = ?",
+            (currency_code,)
+        )
+        
+        conn.commit()
+        conn.close()
+        return True
+        
+    except Exception as e:
+        st.error(f"Error removing currency: {str(e)}")
+        return False
+
+def get_currency_info():
+    """Get detailed information about configured currencies"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        query = """
+            SELECT 
+                ac.currency_code,
+                ac.currency_name,
+                ac.added_date,
+                COUNT(er.id) as data_points,
+                MIN(er.date) as first_date,
+                MAX(er.date) as last_date
+            FROM application_currencies ac
+            LEFT JOIN exchange_rates er ON ac.currency_code = er.target_currency
+            WHERE ac.is_active = 1
+            GROUP BY ac.currency_code, ac.currency_name, ac.added_date
+            ORDER BY ac.currency_code
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error(f"Error getting currency info: {str(e)}")
+        return pd.DataFrame()
+
+# =============================================================================
+# EXISTING BUSINESS LOGIC FUNCTIONS
 # =============================================================================
 
 def get_working_days_in_month(year, month):
@@ -186,19 +327,8 @@ def create_monthly_rate_summary(year, month, currencies=None):
     
     return summary
 
-def get_available_currencies():
-    """Get list of all available currencies in database"""
-    try:
-        conn = sqlite3.connect('fx_rates.db')
-        query = "SELECT DISTINCT target_currency FROM exchange_rates ORDER BY target_currency"
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df['target_currency'].tolist()
-    except:
-        return []
-
 def get_available_months():
-    """Get list of available months with data, defaulting to latest complete month"""
+    """Get list of available months with data"""
     try:
         conn = sqlite3.connect('fx_rates.db')
         query = """
@@ -216,7 +346,7 @@ def get_available_months():
             year = int(row['year'])
             month = int(row['month'])
             
-            # Check if this is a complete month (last day has passed)
+            # Check if this is a complete month
             last_day_of_month = date(year, month, calendar.monthrange(year, month)[1])
             is_complete = last_day_of_month < today
             
@@ -233,7 +363,7 @@ def get_available_months():
         return []
 
 def is_month_complete(year, month):
-    """Check if a month is complete (all working days have passed)"""
+    """Check if a month is complete"""
     today = date.today()
     last_day_of_month = date(year, month, calendar.monthrange(year, month)[1])
     return last_day_of_month < today
@@ -241,9 +371,140 @@ def is_month_complete(year, month):
 def get_next_working_day(target_date):
     """Get the next working day after the given date"""
     next_day = target_date + timedelta(days=1)
-    while next_day.weekday() >= 5:  # Skip weekends
+    while next_day.weekday() >= 5:
         next_day += timedelta(days=1)
     return next_day
+
+# =============================================================================
+# CURRENCY CONFIGURATION INTERFACE
+# =============================================================================
+
+def currency_management_interface():
+    """Interface for managing application currencies"""
+    
+    st.sidebar.subheader("⚙️ Currency Configuration")
+    
+    # Initialize currency config table
+    create_currency_config_table()
+    
+    # Expandable section for currency management
+    with st.sidebar.expander("🔧 Manage Application Currencies", expanded=False):
+        
+        # Get current currencies and available currencies
+        current_app_currencies = get_application_currencies()
+        all_available_currencies = get_all_available_currencies()
+        
+        # Show current application currencies
+        st.write("**Current Application Currencies:**")
+        if current_app_currencies:
+            cols = st.columns(2)
+            for i, curr in enumerate(current_app_currencies):
+                col_idx = i % 2
+                with cols[col_idx]:
+                    st.text(f"• {curr}")
+        else:
+            st.warning("No application currencies configured")
+        
+        st.divider()
+        
+        # Add new currency
+        st.write("**Add New Currency:**")
+        
+        # Available currencies not yet in application list
+        available_to_add = [curr for curr in all_available_currencies if curr not in current_app_currencies]
+        
+        if available_to_add:
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                new_currency = st.selectbox(
+                    "Select currency to add:",
+                    [""] + available_to_add,
+                    key="add_currency_select"
+                )
+            
+            with col2:
+                if st.button("➕ Add", key="add_currency_btn", disabled=not new_currency):
+                    if new_currency:
+                        if add_application_currency(new_currency):
+                            st.success(f"✅ Added {new_currency}")
+                            st.rerun()
+                        else:
+                            st.error("Failed to add currency")
+        else:
+            st.info("All available currencies are already configured")
+        
+        st.divider()
+        
+        # Remove existing currency
+        st.write("**Remove Currency:**")
+        
+        if len(current_app_currencies) > 1:  # Ensure at least one currency remains
+            col1, col2 = st.columns([3, 1])
+            
+            with col1:
+                remove_currency = st.selectbox(
+                    "Select currency to remove:",
+                    [""] + current_app_currencies,
+                    key="remove_currency_select"
+                )
+            
+            with col2:
+                if st.button("🗑️ Remove", key="remove_currency_btn", disabled=not remove_currency):
+                    if remove_currency:
+                        if remove_application_currency(remove_currency):
+                            st.success(f"✅ Removed {remove_currency}")
+                            st.rerun()
+                        else:
+                            st.error("Failed to remove currency")
+        else:
+            st.info("Must have at least one application currency")
+        
+        st.divider()
+        
+        # Currency information
+        if st.button("📊 Show Currency Details", key="show_currency_info"):
+            st.session_state.show_currency_details = not st.session_state.get('show_currency_details', False)
+        
+        if st.session_state.get('show_currency_details', False):
+            currency_info = get_currency_info()
+            if len(currency_info) > 0:
+                st.dataframe(
+                    currency_info[['currency_code', 'currency_name', 'data_points', 'first_date', 'last_date']],
+                    column_config={
+                        "currency_code": "Currency",
+                        "currency_name": "Name", 
+                        "data_points": "Data Points",
+                        "first_date": "First Date",
+                        "last_date": "Last Date"
+                    },
+                    hide_index=True
+                )
+
+def get_currency_info():
+    """Get detailed information about configured currencies"""
+    try:
+        conn = sqlite3.connect('fx_rates.db')
+        query = """
+            SELECT 
+                ac.currency_code,
+                ac.currency_name,
+                ac.added_date,
+                COUNT(er.id) as data_points,
+                MIN(er.date) as first_date,
+                MAX(er.date) as last_date
+            FROM application_currencies ac
+            LEFT JOIN exchange_rates er ON ac.currency_code = er.target_currency
+            WHERE ac.is_active = 1
+            GROUP BY ac.currency_code, ac.currency_name, ac.added_date
+            ORDER BY ac.currency_code
+        """
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error(f"Error getting currency info: {str(e)}")
+        return pd.DataFrame()
 
 # =============================================================================
 # STREAMLIT DASHBOARD
@@ -263,44 +524,50 @@ def main():
     # Sidebar - Configuration
     st.sidebar.header("📊 Configuration")
     
-    # Get available data
-    available_currencies = get_available_currencies()
+    # Currency Configuration Management
+    currency_management_interface()
+    
+    # Get configured currencies
+    available_currencies = get_all_available_currencies() 
+    application_currencies = get_application_currencies()
     available_months = get_available_months()
     
     if not available_currencies:
         st.error("❌ No exchange rate data found! Please run the ECB data collection script first.")
         st.stop()
     
-    # Currency Selection - Updated for Application Currencies
+    # Currency Selection - Now uses dynamic configuration
     st.sidebar.subheader("💱 Currency Selection")
-    
-    # Application currency groups (common business currencies)
-    application_currencies = ['USD', 'EUR', 'JPY', 'CAD', 'AUD', 'CHF', 'CNY']
-    available_application = [curr for curr in application_currencies if curr in available_currencies]
     
     currency_mode = st.sidebar.radio(
         "Select currencies:",
-        ["Application Currencies", "Custom Selection", "All Available"]
+        ["Application Currencies", "Custom Selection", "All Available"],
+        help="Application Currencies are configured in the Currency Configuration section above"
     )
     
     if currency_mode == "Application Currencies":
-        selected_currencies = st.sidebar.multiselect(
-            "Application currencies:",
-            available_application,
-            default=available_application[:5] if len(available_application) >= 5 else available_application,
-            help="Standard currencies used in your organisation's foreign exchange transactions"
-        )
+        if application_currencies:
+            selected_currencies = st.sidebar.multiselect(
+                "Application currencies:",
+                application_currencies,
+                default=application_currencies,
+                help="Currencies configured for your organisation's foreign exchange transactions"
+            )
+        else:
+            st.sidebar.warning("No application currencies configured. Use the configuration panel above.")
+            selected_currencies = []
+            
     elif currency_mode == "Custom Selection":
         selected_currencies = st.sidebar.multiselect(
             "Choose currencies:",
             available_currencies,
-            default=available_application[:3] if available_application else available_currencies[:3]
+            default=application_currencies[:3] if application_currencies else available_currencies[:3]
         )
     else:
         selected_currencies = available_currencies
         st.sidebar.info(f"All {len(available_currencies)} available currencies selected")
     
-    # Time Period Selection - Updated for latest complete month default
+    # Time Period Selection
     st.sidebar.subheader("📅 Time Period")
     
     if available_months:
@@ -309,16 +576,13 @@ def main():
         
         if complete_months:
             month_options = {display_name: (year, month) for year, month, display_name in complete_months}
-            default_selection = list(month_options.keys())[0]  # Latest complete month
         else:
-            # If no complete months, show all with indicators
             month_options = {display_name: (year, month) for year, month, display_name, _ in available_months}
-            default_selection = list(month_options.keys())[0]
         
         selected_month_name = st.sidebar.selectbox(
             "Select month:",
             list(month_options.keys()),
-            index=0,  # Default to first (latest) month
+            index=0,
             help="Rates for current month available from 1st working day of following month"
         )
         
@@ -333,13 +597,15 @@ def main():
     # Main Dashboard
     if selected_currencies:
         
-        # Display current selection
-        col1, col2, col3 = st.columns(3)
+        # Display current selection with enhanced metrics
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("📅 Selected Period", f"{calendar.month_name[selected_month]} {selected_year}")
         with col2:
-            st.metric("💱 Currencies", len(selected_currencies))
+            st.metric("💱 Selected Currencies", len(selected_currencies))
         with col3:
+            st.metric("⚙️ Application Currencies", len(application_currencies))
+        with col4:
             working_days = len(get_working_days_in_month(selected_year, selected_month))
             st.metric("📊 Working Days", working_days)
         
@@ -356,8 +622,8 @@ def main():
         
         if len(summary_data) > 0:
             
-            # Tab layout - Updated spelling
-            tab1, tab2, tab3, tab4 = st.tabs(["📊 Rate Summary", "📈 Visualisations", "📁 Export Data", "📋 Raw Data"])
+            # Tab layout
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Rate Summary", "📈 Visualisations", "📁 Export Data", "📋 Raw Data", "⚙️ Configuration"])
             
             with tab1:
                 st.subheader("💱 Exchange Rate Summary")
@@ -535,6 +801,90 @@ def main():
                     st.info(f"📊 Showing {len(recent_data)} daily rate records")
                 else:
                     st.warning("No raw data available for selected period")
+            
+            with tab5:
+                st.subheader("⚙️ Currency Configuration Details")
+                
+                # Comprehensive currency information
+                currency_info = get_currency_info()
+                
+                if len(currency_info) > 0:
+                    st.write("**Application Currency Analysis:**")
+                    
+                    # Enhanced currency info display
+                    for _, row in currency_info.iterrows():
+                        with st.container():
+                            col1, col2, col3, col4 = st.columns(4)
+                            
+                            with col1:
+                                st.metric(
+                                    label=f"💱 {row['currency_code']}", 
+                                    value=row['currency_name'] or row['currency_code']
+                                )
+                            
+                            with col2:
+                                st.metric(
+                                    label="📊 Data Points",
+                                    value=f"{row['data_points']:,}" if row['data_points'] else "0"
+                                )
+                            
+                            with col3:
+                                st.metric(
+                                    label="📅 First Date",
+                                    value=row['first_date'] if row['first_date'] else "No data"
+                                )
+                            
+                            with col4:
+                                st.metric(
+                                    label="📅 Last Date", 
+                                    value=row['last_date'] if row['last_date'] else "No data"
+                                )
+                    
+                    st.divider()
+                    
+                    # Configuration summary
+                    total_currencies = len(currency_info)
+                    total_data_points = currency_info['data_points'].sum()
+                    avg_data_points = currency_info['data_points'].mean()
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("🔢 Total Currencies", total_currencies)
+                    with col2:
+                        st.metric("📊 Total Data Points", f"{total_data_points:,}")
+                    with col3:
+                        st.metric("📈 Avg per Currency", f"{avg_data_points:.0f}")
+                
+                else:
+                    st.warning("No currency configuration data available")
+                
+                # Data coverage analysis
+                st.subheader("📊 Data Coverage Analysis")
+                
+                # Show which configured currencies have data vs which don't
+                configured_currencies = set(application_currencies)
+                currencies_with_data = set(currency_info['currency_code'].tolist())
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write("**✅ Currencies with Data:**")
+                    currencies_with_data_list = list(currencies_with_data)
+                    if currencies_with_data_list:
+                        for curr in sorted(currencies_with_data_list):
+                            st.text(f"• {curr}")
+                    else:
+                        st.warning("No currencies have data")
+                
+                with col2:
+                    missing_data = configured_currencies - currencies_with_data
+                    st.write("**⚠️ Currencies Missing Data:**")
+                    if missing_data:
+                        for curr in sorted(missing_data):
+                            st.text(f"• {curr}")
+                        st.info("💡 Run ECB importer to collect data for these currencies")
+                    else:
+                        st.success("All configured currencies have data!")
         
         else:
             if not month_is_complete:
@@ -545,10 +895,15 @@ def main():
     
     else:
         st.warning("⚠️ Please select at least one currency to analyse")
+        
+        # Show helpful guidance when no currencies selected
+        if currency_mode == "Application Currencies" and not application_currencies:
+            st.info("💡 **Getting Started:** Use the Currency Configuration panel in the sidebar to set up your organisation's application currencies")
     
-    # Footer - Updated citation
+    # Footer
     st.divider()
     st.markdown("*Exchange Rate Dashboard - Built with Claude, Python, Streamlit & European Central Bank Data*")
 
 if __name__ == "__main__":
     main()
+                
