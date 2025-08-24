@@ -1,3 +1,6 @@
+# fx_dashboard.py - Enhanced with EPM and OneStream Integration Features
+# Complete updated version with EPM analytics built in
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,11 +19,138 @@ import json
 # =============================================================================
 
 st.set_page_config(
-    page_title="Exchange Rate Dashboard",
+    page_title="Exchange Rate Dashboard - EPM Edition",
     page_icon="💱",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# =============================================================================
+# EPM ANALYTICS FUNCTIONS (Integrated directly)
+# =============================================================================
+
+def calculate_translation_impact_summary(selected_currencies, year):
+    """Quick translation impact calculation for dashboard"""
+    
+    conn = sqlite3.connect('fx_rates.db')
+    
+    impact_data = []
+    current_quarter = (datetime.now().month - 1) // 3 + 1
+    
+    for quarter in range(1, current_quarter + 1):
+        start_month = (quarter - 1) * 3 + 1
+        end_month = quarter * 3
+        
+        for currency in selected_currencies:
+            # Get average and closing rates for the quarter
+            avg_query = """
+                SELECT AVG(rate) as avg_rate
+                FROM exchange_rates
+                WHERE target_currency = ?
+                AND strftime('%Y', date) = ?
+                AND CAST(strftime('%m', date) AS INTEGER) BETWEEN ? AND ?
+            """
+            
+            closing_query = """
+                SELECT rate as closing_rate
+                FROM exchange_rates
+                WHERE target_currency = ?
+                AND strftime('%Y', date) = ?
+                AND CAST(strftime('%m', date) AS INTEGER) = ?
+                ORDER BY date DESC
+                LIMIT 1
+            """
+            
+            avg_result = conn.execute(avg_query, [currency, str(year), start_month, end_month]).fetchone()
+            closing_result = conn.execute(closing_query, [currency, str(year), end_month]).fetchone()
+            
+            if avg_result and avg_result[0] and closing_result and closing_result[0]:
+                avg_rate = avg_result[0]
+                closing_rate = closing_result[0]
+                impact_pct = ((closing_rate - avg_rate) / avg_rate) * 100
+                
+                impact_data.append({
+                    'quarter': f'Q{quarter}',
+                    'currency': currency,
+                    'avg_rate': avg_rate,
+                    'closing_rate': closing_rate,
+                    'translation_impact_pct': impact_pct,
+                    'risk_level': 'HIGH' if abs(impact_pct) > 5 else 'MEDIUM' if abs(impact_pct) > 2 else 'LOW'
+                })
+    
+    conn.close()
+    return pd.DataFrame(impact_data)
+
+def generate_onestream_export(year, month, selected_currencies):
+    """Generate OneStream-compatible export file"""
+    
+    monthly_data = create_monthly_rate_summary(year, month, selected_currencies)
+    
+    if len(monthly_data) == 0:
+        return None
+    
+    # OneStream format
+    onestream_records = []
+    
+    for _, row in monthly_data.iterrows():
+        # Average rate record (for Income Statement)
+        avg_record = {
+            'Entity': '[None]',
+            'Account': 'FXRate',
+            'UD1': row['target_currency'],
+            'UD2': 'Average',
+            'UD3': '[None]',
+            'Time': f"{year}M{month:02d}",
+            'Value': row['average_rate'],
+            'Annotation': f"Average rate for {calendar.month_name[month]} {year}"
+        }
+        
+        # Closing rate record (for Balance Sheet)
+        closing_record = {
+            'Entity': '[None]',
+            'Account': 'FXRate', 
+            'UD1': row['target_currency'],
+            'UD2': 'Closing',
+            'UD3': '[None]',
+            'Time': f"{year}M{month:02d}",
+            'Value': row['closing_rate'],
+            'Annotation': f"Closing rate for {calendar.month_name[month]} {year}"
+        }
+        
+        onestream_records.extend([avg_record, closing_record])
+    
+    return pd.DataFrame(onestream_records)
+
+def calculate_volatility_metrics(selected_currencies, days_back=90):
+    """Calculate FX volatility for risk assessment"""
+    
+    conn = sqlite3.connect('fx_rates.db')
+    volatility_data = []
+    
+    for currency in selected_currencies:
+        query = """
+            SELECT date, rate
+            FROM exchange_rates
+            WHERE target_currency = ?
+            AND date >= date('now', '-{} days')
+            ORDER BY date
+        """.format(days_back)
+        
+        df = pd.read_sql_query(query, conn, params=[currency])
+        
+        if len(df) > 30:
+            df['daily_return'] = df['rate'].pct_change()
+            current_vol = df['daily_return'].std() * np.sqrt(252) * 100  # Annualized
+            
+            volatility_data.append({
+                'currency': currency,
+                'volatility_pct': round(current_vol, 2),
+                'risk_category': 'HIGH' if current_vol > 15 else 'MEDIUM' if current_vol > 8 else 'LOW',
+                'data_points': len(df)
+            })
+    
+    conn.close()
+    return pd.DataFrame(volatility_data)
 
 # =============================================================================
 # DATABASE FUNCTIONS
@@ -481,31 +611,6 @@ def currency_management_interface():
                     hide_index=True
                 )
 
-def get_currency_info():
-    """Get detailed information about configured currencies"""
-    try:
-        conn = sqlite3.connect('fx_rates.db')
-        query = """
-            SELECT 
-                ac.currency_code,
-                ac.currency_name,
-                ac.added_date,
-                COUNT(er.id) as data_points,
-                MIN(er.date) as first_date,
-                MAX(er.date) as last_date
-            FROM application_currencies ac
-            LEFT JOIN exchange_rates er ON ac.currency_code = er.target_currency
-            WHERE ac.is_active = 1
-            GROUP BY ac.currency_code, ac.currency_name, ac.added_date
-            ORDER BY ac.currency_code
-        """
-        df = pd.read_sql_query(query, conn)
-        conn.close()
-        return df
-    except Exception as e:
-        st.error(f"Error getting currency info: {str(e)}")
-        return pd.DataFrame()
-
 # =============================================================================
 # STREAMLIT DASHBOARD
 # =============================================================================
@@ -513,12 +618,12 @@ def get_currency_info():
 def main():
     # Header
     st.title("💱 Exchange Rate Dashboard")
-    st.markdown("**Multi-Currency Exchange Rate Analysis for Financial Reporting**")
-    st.markdown("*Base Currency: GBP (British Pound)*")
+    st.markdown("**Multi-Currency Exchange Rate Analysis for EPM & OneStream Integration**")
+    st.markdown("*Base Currency: GBP | Enhanced for EPM Professionals & OneStream Customers*")
     
     # Check if database exists
     if not os.path.exists('fx_rates.db'):
-        st.error("❌ Database not found! Please run the ECB data collection script first.")
+        st.error("❌ Database not found! Please run the enhanced ECB data collection script first.")
         st.stop()
     
     # Sidebar - Configuration
@@ -527,13 +632,35 @@ def main():
     # Currency Configuration Management
     currency_management_interface()
     
+    # EPM Features Section
+    st.sidebar.subheader("🏦 EPM Features")
+    
+    epm_mode = st.sidebar.checkbox(
+        "Enable EPM Analytics",
+        value=True,
+        help="Show OneStream integration and EPM-specific analysis features"
+    )
+    
+    if epm_mode:
+        export_format = st.sidebar.selectbox(
+            "Export Format:",
+            ["Standard CSV", "OneStream Import File", "EPM Analysis Package"],
+            help="Choose export format for your EPM system"
+        )
+        
+        risk_analysis = st.sidebar.checkbox(
+            "Include Risk Analysis",
+            value=True,
+            help="Add FX volatility and translation risk metrics"
+        )
+    
     # Get configured currencies
     available_currencies = get_all_available_currencies() 
     application_currencies = get_application_currencies()
     available_months = get_available_months()
     
     if not available_currencies:
-        st.error("❌ No exchange rate data found! Please run the ECB data collection script first.")
+        st.error("❌ No exchange rate data found! Please run the enhanced ECB data collection script first.")
         st.stop()
     
     # Currency Selection - Now uses dynamic configuration
@@ -597,8 +724,8 @@ def main():
     # Main Dashboard
     if selected_currencies:
         
-        # Display current selection with enhanced metrics
-        col1, col2, col3, col4 = st.columns(4)
+        # Enhanced display current selection with metrics
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("📅 Selected Period", f"{calendar.month_name[selected_month]} {selected_year}")
         with col2:
@@ -608,12 +735,20 @@ def main():
         with col4:
             working_days = len(get_working_days_in_month(selected_year, selected_month))
             st.metric("📊 Working Days", working_days)
+        with col5:
+            # Enhanced metric - total data coverage
+            total_records = len(get_stored_rates(currencies=selected_currencies))
+            st.metric("📋 Total Data Points", f"{total_records:,}")
         
         # Month status indicator
         if not month_is_complete:
             last_day = date(selected_year, selected_month, calendar.monthrange(selected_year, selected_month)[1])
             next_working_day = get_next_working_day(last_day)
             st.info(f"ℹ️ **Month in Progress:** Average and Closing rates for {calendar.month_name[selected_month]} {selected_year} will be available from {next_working_day.strftime('%d %B %Y')} (first working day of following month)")
+        
+        # EPM Context Banner
+        if epm_mode:
+            st.info("🏦 **EPM Mode Active**: Enhanced analytics for OneStream integration, FX risk assessment, and consolidation reporting")
         
         st.divider()
         
@@ -622,8 +757,24 @@ def main():
         
         if len(summary_data) > 0:
             
-            # Tab layout
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Rate Summary", "📈 Visualisations", "📁 Export Data", "📋 Raw Data", "⚙️ Configuration"])
+            # Enhanced tab layout with EPM features
+            if epm_mode:
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+                    "📊 Rate Summary", 
+                    "📈 Visualisations", 
+                    "🏦 EPM Analytics",
+                    "📁 Export Data", 
+                    "📋 Raw Data", 
+                    "⚙️ Configuration"
+                ])
+            else:
+                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                    "📊 Rate Summary", 
+                    "📈 Visualisations", 
+                    "📁 Export Data", 
+                    "📋 Raw Data", 
+                    "⚙️ Configuration"
+                ])
             
             with tab1:
                 st.subheader("💱 Exchange Rate Summary")
@@ -647,7 +798,11 @@ def main():
                     last_update = summary_data['closing_date'].iloc[0] if len(summary_data) > 0 else "N/A"
                     st.metric("📅 Last Update", last_update)
                 
-                # Summary table
+                # EPM Context
+                if epm_mode:
+                    st.info("💼 **EPM Context**: Average rates used for Income Statement translation, Closing rates for Balance Sheet positions")
+                
+                # Summary table with EPM column names
                 st.subheader("📋 Rate Details")
                 
                 display_df = summary_data[[
@@ -655,17 +810,23 @@ def main():
                     'rate_variance', 'variance_percent', 'data_points'
                 ]].copy()
                 
-                display_df.columns = [
-                    'Currency', 'Average Rate', 'Closing Rate', 
-                    'Variance', 'Variance %', 'Data Points'
-                ]
+                if epm_mode:
+                    display_df.columns = [
+                        'Currency', 'Average Rate (P&L)', 'Closing Rate (B/S)', 
+                        'Variance', 'Variance %', 'Data Points'
+                    ]
+                else:
+                    display_df.columns = [
+                        'Currency', 'Average Rate', 'Closing Rate', 
+                        'Variance', 'Variance %', 'Data Points'
+                    ]
                 
                 st.dataframe(
                     display_df,
                     use_container_width=True,
                     column_config={
-                        "Average Rate": st.column_config.NumberColumn(format="%.6f"),
-                        "Closing Rate": st.column_config.NumberColumn(format="%.6f"),
+                        "Average Rate (P&L)" if epm_mode else "Average Rate": st.column_config.NumberColumn(format="%.6f"),
+                        "Closing Rate (B/S)" if epm_mode else "Closing Rate": st.column_config.NumberColumn(format="%.6f"),
                         "Variance": st.column_config.NumberColumn(format="%.6f"),
                         "Variance %": st.column_config.NumberColumn(format="%.2f%%"),
                     }
@@ -678,21 +839,21 @@ def main():
                 fig1 = go.Figure()
                 
                 fig1.add_trace(go.Bar(
-                    name='Average Rate',
+                    name='Average Rate' if not epm_mode else 'Average Rate (P&L)',
                     x=summary_data['target_currency'],
                     y=summary_data['average_rate'],
                     marker_color='lightblue'
                 ))
                 
                 fig1.add_trace(go.Bar(
-                    name='Closing Rate', 
+                    name='Closing Rate' if not epm_mode else 'Closing Rate (B/S)', 
                     x=summary_data['target_currency'],
                     y=summary_data['closing_rate'],
                     marker_color='orange'
                 ))
                 
                 fig1.update_layout(
-                    title=f'Average vs Closing Rates - {calendar.month_name[selected_month]} {selected_year}',
+                    title=f'Average vs Closing Rates - {calendar.month_name[selected_month]} {selected_year}' + (' (EPM View)' if epm_mode else ''),
                     xaxis_title='Currency',
                     yaxis_title='Exchange Rate (1 GBP =)',
                     barmode='group',
@@ -706,14 +867,14 @@ def main():
                     summary_data,
                     x='target_currency',
                     y='variance_percent',
-                    title='Rate Variance Analysis (%)',
+                    title='Rate Variance Analysis (%)' + (' - Translation Impact' if epm_mode else ''),
                     color='variance_percent',
                     color_continuous_scale='RdYlBu_r'
                 )
                 
                 fig2.update_layout(
                     xaxis_title='Currency',
-                    yaxis_title='Variance (%)',
+                    yaxis_title='Variance (%)' + (' - Translation Risk' if epm_mode else ''),
                     height=400
                 )
                 
@@ -724,7 +885,7 @@ def main():
                     summary_data,
                     x='target_currency',
                     y='data_points',
-                    title='Data Points per Currency',
+                    title='Data Quality - Points per Currency',
                     color='data_points',
                     color_continuous_scale='Greens'
                 )
@@ -737,48 +898,189 @@ def main():
                 
                 st.plotly_chart(fig3, use_container_width=True)
             
-            with tab3:
+            # NEW EPM ANALYTICS TAB
+            if epm_mode:
+                with tab3:
+                    st.subheader("🏦 EPM & OneStream Analytics")
+                    
+                    # Translation Impact Analysis
+                    st.markdown("### 📊 Translation Impact Analysis")
+                    st.markdown("*Critical for understanding FX impact on consolidated financial statements*")
+                    
+                    if risk_analysis:
+                        # Calculate translation impacts
+                        translation_data = calculate_translation_impact_summary(selected_currencies, selected_year)
+                        
+                        if len(translation_data) > 0:
+                            # Translation impact chart
+                            fig_translation = px.bar(
+                                translation_data,
+                                x='currency',
+                                y='translation_impact_pct',
+                                color='risk_level',
+                                facet_col='quarter',
+                                title='Translation Impact by Quarter (%)',
+                                color_discrete_map={'HIGH': 'red', 'MEDIUM': 'orange', 'LOW': 'green'}
+                            )
+                            
+                            st.plotly_chart(fig_translation, use_container_width=True)
+                            
+                            # Summary metrics
+                            col1, col2, col3 = st.columns(3)
+                            
+                            with col1:
+                                high_risk_count = len(translation_data[translation_data['risk_level'] == 'HIGH'])
+                                st.metric("🔴 High Risk Currencies", high_risk_count)
+                            
+                            with col2:
+                                max_impact = translation_data['translation_impact_pct'].abs().max()
+                                st.metric("📈 Max Translation Impact", f"{max_impact:.2f}%")
+                            
+                            with col3:
+                                avg_impact = translation_data['translation_impact_pct'].abs().mean()
+                                st.metric("📊 Average Impact", f"{avg_impact:.2f}%")
+                        else:
+                            st.info("📊 Translation impact analysis requires quarterly data. Select a complete quarter to see analysis.")
+                    
+                    # FX Volatility Risk Assessment
+                    st.markdown("### ⚠️ FX Volatility Risk Assessment")
+                    st.markdown("*90-day rolling volatility analysis for hedging decisions*")
+                    
+                    volatility_data = calculate_volatility_metrics(selected_currencies)
+                    
+                    if len(volatility_data) > 0:
+                        # Volatility risk chart
+                        fig_vol = px.bar(
+                            volatility_data,
+                            x='currency',
+                            y='volatility_pct',
+                            color='risk_category',
+                            title='FX Volatility Risk Assessment (90-day Annualized)',
+                            color_discrete_map={'HIGH': 'red', 'MEDIUM': 'orange', 'LOW': 'green'}
+                        )
+                        
+                        fig_vol.add_hline(y=15, line_dash="dash", line_color="red", 
+                                         annotation_text="High Risk Threshold")
+                        fig_vol.add_hline(y=8, line_dash="dash", line_color="orange", 
+                                         annotation_text="Medium Risk Threshold")
+                        
+                        st.plotly_chart(fig_vol, use_container_width=True)
+                        
+                        # Volatility summary table
+                        st.dataframe(
+                            volatility_data[['currency', 'volatility_pct', 'risk_category']],
+                            column_config={
+                                'volatility_pct': st.column_config.NumberColumn('Volatility %', format='%.2f%%'),
+                                'risk_category': st.column_config.TextColumn('Risk Level')
+                            }
+                        )
+                        
+                        # Risk recommendations
+                        high_risk_currencies = volatility_data[volatility_data['risk_category'] == 'HIGH']['currency'].tolist()
+                        if high_risk_currencies:
+                            st.warning(f"⚠️ **High Risk Currencies**: {', '.join(high_risk_currencies)}")
+                            st.markdown("**Recommended Actions:**")
+                            st.markdown("- Consider active hedging strategies")
+                            st.markdown("- Increase monitoring frequency") 
+                            st.markdown("- Review exposure limits")
+                        else:
+                            st.success("✅ All currencies within acceptable volatility ranges")
+                    
+                    # OneStream Integration Preview
+                    st.markdown("### 🔗 OneStream Integration Preview")
+                    
+                    if st.button("🎯 Generate OneStream Import Preview"):
+                        onestream_preview = generate_onestream_export(selected_year, selected_month, selected_currencies[:3])  # Limit for preview
+                        
+                        if onestream_preview is not None:
+                            st.markdown("**OneStream Import File Format:**")
+                            st.dataframe(onestream_preview.head(10))
+                            st.info("💡 Full export available in Export Data tab")
+                        else:
+                            st.warning("No data available for OneStream export preview")
+            
+            # Enhanced Export Tab
+            with tab4 if epm_mode else tab3:
                 st.subheader("📁 Export Exchange Rates")
                 
                 col1, col2 = st.columns(2)
                 
                 with col1:
-                    st.info("💼 **Business Use Case**\n\nExport rates for EPM systems like OneStream:\n- Average rates for Income Statement\n- Closing rates for Balance Sheet\n- Ready for multi-currency consolidation")
+                    if epm_mode:
+                        st.info("🏦 **EPM Integration Ready**\n\nExport formats:\n- **OneStream**: Direct import file\n- **Standard**: Multi-purpose CSV\n- **EPM Package**: Complete analysis suite")
+                    else:
+                        st.info("💼 **Business Use Case**\n\nExport rates for EPM systems like OneStream:\n- Average rates for Income Statement\n- Closing rates for Balance Sheet")
                 
                 with col2:
-                    # Prepare export data
-                    export_df = summary_data[[
-                        'target_currency', 'average_rate', 'closing_rate', 
-                        'average_inverse_rate', 'closing_inverse_rate',
-                        'rate_variance', 'variance_percent', 'data_points',
-                        'closing_date', 'month_name', 'year'
-                    ]].copy()
+                    if epm_mode and export_format == "OneStream Import File":
+                        # OneStream export
+                        onestream_data = generate_onestream_export(selected_year, selected_month, selected_currencies)
+                        
+                        if onestream_data is not None:
+                            csv_buffer = BytesIO()
+                            onestream_data.to_csv(csv_buffer, index=False)
+                            csv_data = csv_buffer.getvalue()
+                            
+                            filename = f"OneStream_FXRates_{selected_year}M{selected_month:02d}.csv"
+                            
+                            st.download_button(
+                                label="📥 Download OneStream File",
+                                data=csv_data,
+                                file_name=filename,
+                                mime="text/csv",
+                                use_container_width=True
+                            )
+                            
+                            st.success(f"✅ OneStream import file ready ({len(onestream_data)} rate records)")
+                        else:
+                            st.warning("No OneStream data available for selected period")
                     
-                    export_df.columns = [
-                        'Currency', 'Average_Rate_GBP', 'Closing_Rate_GBP',
-                        'Average_Inverse_Rate', 'Closing_Inverse_Rate', 
-                        'Rate_Variance', 'Variance_Percent', 'Data_Points',
-                        'Closing_Date', 'Month', 'Year'
-                    ]
+                    elif epm_mode and export_format == "EPM Analysis Package":
+                        # Complete EPM package with multiple files
+                        st.markdown("**EPM Analysis Package includes:**")
+                        st.markdown("- Exchange rate data")
+                        st.markdown("- Translation impact analysis")
+                        st.markdown("- Volatility risk assessment") 
+                        st.markdown("- OneStream import file")
+                        
+                        if st.button("📦 Generate EPM Package", use_container_width=True):
+                            st.info("📦 EPM Analysis Package generation - Feature coming soon!")
+                            st.markdown("Package will include multiple Excel sheets with comprehensive analysis")
                     
-                    # Convert to CSV
-                    csv_buffer = BytesIO()
-                    export_df.to_csv(csv_buffer, index=False)
-                    csv_data = csv_buffer.getvalue()
-                    
-                    filename = f"fx_rates_{selected_year}_{selected_month:02d}_{len(selected_currencies)}currencies.csv"
-                    
-                    st.download_button(
-                        label="📥 Download CSV",
-                        data=csv_data,
-                        file_name=filename,
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                    
-                    st.success(f"✅ Ready to export {len(export_df)} currency rates")
+                    else:
+                        # Standard CSV export
+                        export_df = summary_data[[
+                            'target_currency', 'average_rate', 'closing_rate', 
+                            'average_inverse_rate', 'closing_inverse_rate',
+                            'rate_variance', 'variance_percent', 'data_points',
+                            'closing_date', 'month_name', 'year'
+                        ]].copy()
+                        
+                        export_df.columns = [
+                            'Currency', 'Average_Rate_GBP', 'Closing_Rate_GBP',
+                            'Average_Inverse_Rate', 'Closing_Inverse_Rate', 
+                            'Rate_Variance', 'Variance_Percent', 'Data_Points',
+                            'Closing_Date', 'Month', 'Year'
+                        ]
+                        
+                        csv_buffer = BytesIO()
+                        export_df.to_csv(csv_buffer, index=False)
+                        csv_data = csv_buffer.getvalue()
+                        
+                        filename = f"fx_rates_{selected_year}_{selected_month:02d}_{len(selected_currencies)}currencies.csv"
+                        
+                        st.download_button(
+                            label="📥 Download Standard CSV",
+                            data=csv_data,
+                            file_name=filename,
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                        
+                        st.success(f"✅ Ready to export {len(export_df)} currency rates")
             
-            with tab4:
+            # Raw Data Tab
+            with tab5 if epm_mode else tab4:
                 st.subheader("📋 Raw Exchange Rate Data")
                 
                 # Show recent daily rates
@@ -802,7 +1104,8 @@ def main():
                 else:
                     st.warning("No raw data available for selected period")
             
-            with tab5:
+            # Configuration Tab
+            with tab6 if epm_mode else tab5:
                 st.subheader("⚙️ Currency Configuration Details")
                 
                 # Comprehensive currency information
@@ -882,7 +1185,7 @@ def main():
                     if missing_data:
                         for curr in sorted(missing_data):
                             st.text(f"• {curr}")
-                        st.info("💡 Run ECB importer to collect data for these currencies")
+                        st.info("💡 Run enhanced ECB importer to collect data for these currencies")
                     else:
                         st.success("All configured currencies have data!")
         
@@ -891,7 +1194,7 @@ def main():
                 st.info(f"ℹ️ **Rates Not Yet Available:** Average and Closing rates for {calendar.month_name[selected_month]} {selected_year} will be calculated and available from the first working day of {calendar.month_name[selected_month + 1 if selected_month < 12 else 1]} {selected_year if selected_month < 12 else selected_year + 1}")
             else:
                 st.warning(f"❌ No data available for {calendar.month_name[selected_month]} {selected_year}")
-                st.info("💡 Make sure you have run the ECB data collection script for this time period")
+                st.info("💡 Make sure you have run the enhanced ECB data collection script for this time period")
     
     else:
         st.warning("⚠️ Please select at least one currency to analyse")
@@ -900,10 +1203,22 @@ def main():
         if currency_mode == "Application Currencies" and not application_currencies:
             st.info("💡 **Getting Started:** Use the Currency Configuration panel in the sidebar to set up your organisation's application currencies")
     
-    # Footer
+    # Enhanced footer
     st.divider()
-    st.markdown("*Exchange Rate Dashboard - Built with Claude, Python, Streamlit & European Central Bank Data*")
+    if epm_mode:
+        st.markdown("*EPM Exchange Rate Dashboard - OneStream Integration Ready | Built with Claude, Python, Streamlit & ECB Data*")
+        st.markdown("🎯 **Target Audience**: OneStream Customers, EPM Consultants, Corporate Finance Teams")
+        
+        # Add professional credentials section
+        with st.expander("📋 Technical Specifications", expanded=False):
+            st.markdown("**Data Sources**: European Central Bank (ECB) Official Reference Rates")
+            st.markdown("**Update Frequency**: Daily (working days only)")
+            st.markdown("**Base Currency**: GBP (British Pound)")
+            st.markdown("**Export Formats**: CSV, OneStream Import Files")
+            st.markdown("**Risk Analytics**: 90-day rolling volatility, translation impact analysis")
+            st.markdown("**Compliance**: Working day logic, audit trail, data validation")
+    else:
+        st.markdown("*Exchange Rate Dashboard - Built with Claude, Python, Streamlit & European Central Bank Data*")
 
 if __name__ == "__main__":
     main()
-                
